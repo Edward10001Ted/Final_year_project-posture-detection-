@@ -1,0 +1,344 @@
+import cv2
+import numpy as np
+import time
+import threading
+from ultralytics import YOLO
+import math
+
+# Modern MediaPipe Tasks API imports
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# =====================================================================
+# 1. THE SHARED GLOBAL VARIABLE FOR YOUR EXTERNAL SOFTWARE
+# =====================================================================
+LIVE_OUTPUT_STREAM = {
+    "system_epoch_time": 0,       
+    "active_workers_count": 0,    
+    "workers": {}                 
+}
+
+# Simple centroid tracker state for assigning persistent IDs
+TRACKER = {
+    "next_id": 0,
+    "objects": {}  # id -> {centroid: (x,y), bbox: (x1,y1,x2,y2), last_seen: frame_idx}
+}
+
+# Mapping numeric tracker IDs to human-friendly labels
+TRACKER_LABELS = {}
+TRACKER_LABEL_COUNTER = 0
+
+
+def _label_for_id(tid):
+    global TRACKER_LABEL_COUNTER
+    if tid in TRACKER_LABELS:
+        return TRACKER_LABELS[tid]
+    n = TRACKER_LABEL_COUNTER
+    letter = chr(ord('A') + (n % 26))
+    suffix = n // 26
+    label = f"{letter}{suffix}" if suffix > 0 else letter
+    human = f"Person {label}"
+    TRACKER_LABELS[tid] = human
+    TRACKER_LABEL_COUNTER += 1
+    return human
+
+# Simple centroid tracker to persist person IDs across frames
+TRACKER_NEXT_ID = 0
+TRACKER_LAST_POS = {}  # id -> (x,y)
+TRACKER_LAST_UPDATE = {}  # id -> timestamp
+
+# =====================================================================
+# 2. INITIALIZE ML MODELS LOCALLY
+# =====================================================================
+# We use 'yolov8m.pt' (Medium) here because your local PC/Laptop can 
+# handle it easily, giving you much higher accuracy than a Raspberry Pi!
+print("Loading YOLOv8 Models...")
+yolo_model = YOLO("yolov8m.pt") 
+
+print("Loading MediaPipe Pose Landmarker...")
+base_options = python.BaseOptions(model_asset_path='pose_landmarker_full.task')
+options = vision.PoseLandmarkerOptions(
+    base_options=base_options,
+    running_mode=vision.RunningMode.IMAGE,
+    num_poses=4, 
+)
+landmarker = vision.PoseLandmarker.create_from_options(options)
+
+LAPTOP_ID = 63
+KEYBOARD_ID = 66
+MONITOR_ID = 62
+# =====================================================================
+# 3. GEOMETRIC HEURISTIC FUNCTIONS
+# =====================================================================
+def check_hands_on_keyboard(wrists, keyboard_boxes):
+    if not wrists or not keyboard_boxes: return False, None
+    threshold_px = 50 # Slightly more forgiving threshold for desktop cameras
+    for wrist in wrists:
+        w_x, w_y = wrist
+        for box in keyboard_boxes:
+            x1, y1, x2, y2 = box
+            if (x1 - threshold_px <= w_x <= x2 + threshold_px) and \
+               (y1 - threshold_px <= w_y <= y2 + threshold_px):
+                return True, box
+    return False, None
+
+def check_facing_screen(single_pose_landmarks, monitor_boxes, img_w):
+    if not single_pose_landmarks or not monitor_boxes: return False, None
+    
+    nose = single_pose_landmarks[0]
+    left_ear = single_pose_landmarks[7]
+    right_ear = single_pose_landmarks[8]
+    
+    if left_ear.visibility < 0.4 or right_ear.visibility < 0.4: 
+        return False, None
+        
+    nose_x = int(nose.x * img_w)
+    for box in monitor_boxes:
+        x1, _, x2, _ = box
+        if x1 <= nose_x <= x2: 
+            return True, box
+    return False, None
+
+
+def _compute_bbox_and_centroid(landmarks, img_w, img_h):
+    xs = [int(l.x * img_w) for l in landmarks]
+    ys = [int(l.y * img_h) for l in landmarks]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+    return [x1, y1, x2, y2], (cx, cy)
+
+
+def _update_tracker(detections, frame_idx, max_distance=120):
+    """detections: list of tuples (person_idx, centroid, bbox)
+    Returns mapping person_idx -> assigned_id and updates TRACKER."""
+    assigned = {}
+    # mark all current as not matched
+    unmatched_existing = set(TRACKER["objects"].keys())
+
+    for person_idx, centroid, bbox in detections:
+        best_id = None
+        best_dist = None
+        for obj_id, info in TRACKER["objects"].items():
+            ex_cx, ex_cy = info["centroid"]
+            dist = ((ex_cx - centroid[0])**2 + (ex_cy - centroid[1])**2)**0.5
+            if dist <= max_distance and (best_dist is None or dist < best_dist):
+                best_dist = dist
+                best_id = obj_id
+
+        if best_id is not None:
+            # update existing
+            TRACKER["objects"][best_id]["centroid"] = centroid
+            TRACKER["objects"][best_id]["bbox"] = bbox
+            TRACKER["objects"][best_id]["last_seen"] = frame_idx
+            assigned[person_idx] = best_id
+            if best_id in unmatched_existing:
+                unmatched_existing.remove(best_id)
+        else:
+            # create new
+            new_id = TRACKER["next_id"]
+            TRACKER["next_id"] += 1
+            TRACKER["objects"][new_id] = {"centroid": centroid, "bbox": bbox, "last_seen": frame_idx}
+            assigned[person_idx] = new_id
+
+    # Remove stale objects not seen for a while
+    stale_ids = [obj_id for obj_id, info in TRACKER["objects"].items() if frame_idx - info["last_seen"] > 30]
+    for sid in stale_ids:
+        del TRACKER["objects"][sid]
+
+    return assigned
+
+# =====================================================================
+# 4. CORE ENGINE WORKER THREAD
+# =====================================================================
+def run_ai_webcam_loop():
+    """Background loop that captures webcam and updates our live variable continuously."""
+    global LIVE_OUTPUT_STREAM
+    global TRACKER_NEXT_ID, TRACKER_LAST_POS, TRACKER_LAST_UPDATE
+    
+    # Target 0 for the default built-in laptop webcam or primary USB camera
+    cap = cv2.VideoCapture(0)
+    
+    # Set to HD resolution
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    print("\n>>> Local AI Engine Is Running Successfully! <<<")
+    
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success: break
+                
+            h, w, _ = frame.shape
+            timestamp_ms = int(time.time() * 1000) 
+            
+            # Run Object Detection
+            yolo_results = yolo_model(frame, verbose=False)[0]
+            keyboard_boxes, monitor_boxes = [], []
+            
+            for box in yolo_results.boxes:
+                cls_id = int(box.cls[0])
+                xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+                if cls_id in [KEYBOARD_ID, LAPTOP_ID]:
+                    keyboard_boxes.append(xyxy)
+                elif cls_id == MONITOR_ID:
+                    monitor_boxes.append(xyxy)
+# Run Pose Detection
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            pose_results = landmarker.detect(mp_image)
+            
+            frame_workers_state = {}
+            
+            if pose_results.pose_landmarks:
+                for person_idx, person_landmarks in enumerate(pose_results.pose_landmarks):
+                    wrists = []
+                    left_wrist = person_landmarks[15]
+                    right_wrist = person_landmarks[16]
+                    
+                    if left_wrist.visibility > 0.5: wrists.append((int(left_wrist.x * w), int(left_wrist.y * h)))
+                    if right_wrist.visibility > 0.5: wrists.append((int(right_wrist.x * w), int(right_wrist.y * h)))
+                    
+                    is_facing, active_monitor = check_facing_screen(person_landmarks, monitor_boxes + keyboard_boxes, w)
+                    hands_on_keys, active_keyboard = check_hands_on_keyboard(wrists, keyboard_boxes)
+                    
+                    local_equipment = {}
+                    if active_keyboard: local_equipment["Input_Device"] = active_keyboard
+                    if active_monitor: local_equipment["Display_Screen"] = active_monitor
+                    
+                    is_working = hands_on_keys
+
+                    # compute bbox and centroid from landmarks for this person
+                    xs = [int(lm.x * w) for lm in person_landmarks]
+                    ys = [int(lm.y * h) for lm in person_landmarks]
+                    x1, x2 = min(xs), max(xs)
+                    y1, y2 = min(ys), max(ys)
+                    bbox = [x1, y1, x2, y2]
+                    centroid = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+
+                    frame_workers_state[person_idx] = {
+                        "status": "WORKING" if is_working else "NOT-WORKING",
+                        "is_facing_screen": bool(is_facing),
+                        "hands_on_keyboard": bool(hands_on_keys),
+                        "equipment": local_equipment,
+                        "bbox": bbox,
+                        "centroid": centroid
+                    }
+
+            # --- Simple centroid-based ID assignment ---
+            assigned_workers = {}
+            now_ts = time.time()
+            used_tracker_ids = set()
+            # match existing trackers to detected centroids
+            for person_idx, metrics in frame_workers_state.items():
+                c = metrics.get("centroid")
+                assigned_id = None
+                if c:
+                    best_id = None
+                    best_dist = None
+                    for tid, pos in TRACKER_LAST_POS.items():
+                        if tid in used_tracker_ids:
+                            continue
+                        dist = math.hypot(pos[0] - c[0], pos[1] - c[1])
+                        if best_dist is None or dist < best_dist:
+                            best_dist = dist
+                            best_id = tid
+                    # threshold for matching
+                    if best_dist is not None and best_dist < 100:
+                        assigned_id = best_id
+                        used_tracker_ids.add(assigned_id)
+                if assigned_id is None:
+                    # create new tracker id
+                    assigned_id = TRACKER_NEXT_ID
+                    TRACKER_NEXT_ID += 1
+                    used_tracker_ids.add(assigned_id)
+
+                # update tracker position and timestamp
+                TRACKER_LAST_POS[assigned_id] = metrics.get("centroid") or (0,0)
+                TRACKER_LAST_UPDATE[assigned_id] = now_ts
+
+                assigned_workers[assigned_id] = metrics
+
+            # cleanup old trackers not seen for >5s
+            to_delete = [tid for tid, t in TRACKER_LAST_UPDATE.items() if now_ts - t > 5.0]
+            for tid in to_delete:
+                TRACKER_LAST_POS.pop(tid, None)
+                TRACKER_LAST_UPDATE.pop(tid, None)
+
+            # Use assigned_workers for live stream
+            LIVE_OUTPUT_STREAM["active_workers_count"] = len(assigned_workers)
+            LIVE_OUTPUT_STREAM["workers"] = assigned_workers
+            
+            # continue to display visual frame with bbox draws
+            for aid, metrics in assigned_workers.items():
+                bbox = metrics.get("bbox")
+                if bbox:
+                    x1, y1, x2, y2 = bbox
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    label = _label_for_id(aid)
+                    cv2.putText(frame, f"{label} (ID:{aid}) {metrics['status']}", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+            
+            # Safely write directly to the global variable (timestamp already updated above)
+            LIVE_OUTPUT_STREAM["system_epoch_time"] = now_ts
+            
+            # Optional: Display a local desktop window so you can see yourself
+            # (Press 'q' inside the window to close the visual screen)
+            cv2.putText(frame, f"Active Tracking: {len(frame_workers_state)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("Local AI Pipeline Debugger", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        landmarker.close()
+
+# Start the AI loop automatically inside a concurrent background thread.
+# This prevents it from blocking your custom software logic loop from running!
+ai_thread = threading.Thread(target=run_ai_webcam_loop, daemon=True)
+ai_thread.start()
+
+# =====================================================================
+# 5. YOUR CUSTOM SOFTWARE PART (The Downstream Analytics Code)
+# =====================================================================
+# This is where your custom software lives. It runs alongside the AI engine 
+# and can read the live variable anytime it wants.
+if __name__ == "__main__":
+    # Let the camera spin up for a brief 2 seconds
+    time.sleep(2)
+    
+    print("\nStarting Your Downstream Productivity Software Loop...")
+    
+    # Example: Check the live data stream every 5 seconds to process it
+    try:
+        while True:
+            print("\n" + "="*50)
+            print(f"--- DOWNSTREAM SOFTWARE SYNC AT TIMESTAMP: {time.strftime('%H:%M:%S')} ---")
+            
+            # 1. Capture the current data live out of the variable!
+            current_data = LIVE_OUTPUT_STREAM
+            
+            print(f"Total People Detected in Workspace: {current_data['active_workers_count']}")
+            
+            # 2. Iterate through all discovered workers and feed them into your logic
+            if current_data.get("workers"):
+                for worker_id, metrics in current_data["workers"].items():
+                    bbox = metrics.get('bbox')
+                    centroid = metrics.get('centroid')
+                    label = _label_for_id(worker_id)
+                    print(f" -> [{label} ID:{worker_id}] Status: {metrics['status']} | bbox: {bbox} | centroid: {centroid}", flush=True)
+                    print(f"    - Looking at screen? {metrics['is_facing_screen']} | Hands typing? {metrics['hands_on_keyboard']}", flush=True)
+                    print(f"    - Equipment Coords: {metrics['equipment']}", flush=True)
+            else:
+                print("No workers detected", flush=True)
+                
+                # --- YOUR MISSION LOGIC GOES HERE ---
+                # example: if metrics['status'] == "WORKING": update_database()
+                
+            time.sleep(5) # Poll the variable every 5 seconds
+            
+    except KeyboardInterrupt:
+        print("\nStopping software pipeline.")
